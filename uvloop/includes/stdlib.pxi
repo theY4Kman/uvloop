@@ -31,6 +31,7 @@ cdef aio_InvalidStateError = asyncio.InvalidStateError
 cdef aio_TimeoutError = asyncio.TimeoutError
 cdef aio_Future = asyncio.Future
 cdef aio_Task = asyncio.Task
+cdef aio_tasks_current_tasks = asyncio.tasks._current_tasks
 cdef aio_ensure_future = asyncio.ensure_future
 cdef aio_gather = asyncio.gather
 cdef aio_wait = asyncio.wait

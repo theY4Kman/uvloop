@@ -47,7 +47,11 @@ cdef class Handle:
 
         try:
             assert self.context is not None
-            Context_Enter(self.context)
+            try:
+                Context_Enter(self.context)
+            except RuntimeError:
+                if self.loop._reentrant == 0:
+                    raise
 
             if cb_type == 1:
                 callback = self.arg1
@@ -101,7 +105,11 @@ cdef class Handle:
         finally:
             context = self.context
             Py_DECREF(self)
-            Context_Exit(context)
+            try:
+                Context_Exit(self.context)
+            except RuntimeError:
+                if self.loop._reentrant == 0:
+                    raise
 
     cdef _cancel(self):
         self._cancelled = 1

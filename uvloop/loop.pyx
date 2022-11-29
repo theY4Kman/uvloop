@@ -1,6 +1,8 @@
 # cython: language_level=3, embedsignature=True
 
 import asyncio
+from contextlib import contextmanager
+
 cimport cython
 
 from .includes.debug cimport UVLOOP_DEBUG
@@ -146,6 +148,7 @@ cdef class Loop:
         self._thread_id = 0
         self._running = 0
         self._stopping = 0
+        self._reentrant = 0
 
         self._transports = weakref_WeakValueDictionary()
         self._processes = set()
@@ -237,6 +240,11 @@ cdef class Loop:
         PyMem_RawFree(self.uvloop)
         self.uvloop = NULL
 
+    @property
+    def _nest_patched(self):
+        self._reentrant = 1
+        return True
+
     cdef _init_debug_fields(self):
         self._debug_cc = bool(UVLOOP_DEBUG)
 
@@ -287,6 +295,8 @@ cdef class Loop:
             return
 
         if self._listening_signals:
+            if self._reentrant:
+                return
             raise RuntimeError('signals handling has been already setup')
 
         if self._ssock is not None:
@@ -337,7 +347,7 @@ cdef class Loop:
             else:
                 return
 
-        if not self._listening_signals:
+        if not self._listening_signals and self._reentrant == 0:
             raise RuntimeError('signals handling has not been setup')
 
         self._listening_signals = False
@@ -514,13 +524,16 @@ cdef class Loop:
         if self._closed == 1:
             raise RuntimeError('unable to start the loop; it was closed')
 
-        if self._running == 1:
+        if self._running == 1 and self._reentrant == 0:
             raise RuntimeError('this event loop is already running.')
 
-        if (aio_get_running_loop is not None and
-                aio_get_running_loop() is not None):
-            raise RuntimeError(
-                'Cannot run the event loop while another loop is running')
+        if self._reentrant == 0:
+            running_loop = (
+                aio_get_running_loop is not None and aio_get_running_loop()
+            )
+            if running_loop is not None:
+                raise RuntimeError(
+                    'Cannot run the event loop while another loop is running')
 
         # reset _last_error
         self._last_error = None
@@ -1364,7 +1377,7 @@ cdef class Loop:
     def run_forever(self):
         """Run the event loop until stop() is called."""
         self._check_closed()
-        mode = uv.UV_RUN_DEFAULT
+        mode = uv.UV_RUN_ONCE if self._reentrant else uv.UV_RUN_DEFAULT
         if self._stopping:
             # loop.stop() was called right before loop.run_forever().
             # This is how asyncio loop behaves.
@@ -1374,10 +1387,47 @@ cdef class Loop:
         sys.set_asyncgen_hooks(firstiter=self._asyncgen_firstiter_hook,
                                finalizer=self._asyncgen_finalizer_hook)
         try:
-            self._run(mode)
+            if self._reentrant:
+                with self._manage_run():
+                    while True:
+                        self._run(mode)
+                        if self._stopping:
+                            break
+            else:
+                self._run(mode)
         finally:
             self._set_coroutine_debug(False)
             sys.set_asyncgen_hooks(*old_agen_hooks)
+
+    @contextmanager
+    def _manage_run(self):
+        """Set up the loop for running."""
+        self._check_closed()
+        old_running = self._running
+        old_thread_id = self._thread_id
+        old_running_loop = aio_get_running_loop is not None and aio_get_running_loop()
+        old_context = self.handler_idle.h.context
+        # handles = (self.handler_async.h)
+        try:
+            self._thread_id = PyThread_get_thread_ident()
+            self.handler_idle.h._set_context(Context_CopyCurrent())
+            self._running = 1
+            yield
+        finally:
+            self._thread_id = old_thread_id
+            self._running = old_running
+            if aio_set_running_loop is not None:
+                aio_set_running_loop(old_running_loop)
+
+    @contextmanager
+    def _manage_task(self, future = None):
+        """Bookkeep current tasks."""
+        old_current_task = aio_tasks_current_tasks.get(self)
+        try:
+            aio_tasks_current_tasks.pop(self, None)
+            yield
+        finally:
+            aio_tasks_current_tasks[self] = old_current_task
 
     def close(self):
         """Close the event loop.
@@ -1501,7 +1551,15 @@ cdef class Loop:
 
         future.add_done_callback(done_cb)
         try:
-            self.run_forever()
+            if self._reentrant:
+                with self._manage_run():
+                    while not future.done():
+                        with self._manage_task():
+                            self._run(uv.UV_RUN_ONCE)
+                        if self._stopping:
+                            break
+            else:
+                self.run_forever()
         except BaseException:
             if new_task and future.done() and not future.cancelled():
                 # The coroutine raised a BaseException. Consume the exception
